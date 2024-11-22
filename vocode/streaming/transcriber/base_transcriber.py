@@ -2,35 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import audioop
-from opentelemetry import trace, metrics
-from typing import Generic, TypeVar, Union
-from vocode.streaming.models.audio_encoding import AudioEncoding
-from vocode.streaming.models.model import BaseModel
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Generic, Optional, TypeVar, Union
 
-from vocode.streaming.models.transcriber import TranscriberConfig
-from vocode.streaming.utils.worker import AsyncWorker, ThreadAsyncWorker
+from vocode.streaming.models.audio import AudioEncoding
+from vocode.streaming.models.transcriber import TranscriberConfig, Transcription
+from vocode.streaming.utils.speed_manager import SpeedManager
+from vocode.streaming.utils.worker import AbstractWorker, AsyncWorker, ThreadAsyncWorker
 
-
-tracer = trace.get_tracer(__name__)
-meter = metrics.get_meter(__name__)
-
-class Transcription(BaseModel):
-    message: str
-    confidence: float
-    is_final: bool
-    is_interrupt: bool = False
-
-    def __str__(self):
-        return f"Transcription({self.message}, {self.confidence}, {self.is_final})"
-
+if TYPE_CHECKING:
+    from vocode.streaming.streaming_conversation import StreamingConversation
 
 TranscriberConfigType = TypeVar("TranscriberConfigType", bound=TranscriberConfig)
 
 
-class AbstractTranscriber(Generic[TranscriberConfigType]):
+class AbstractTranscriber(Generic[TranscriberConfigType], AbstractWorker[bytes]):
+    consumer: AbstractWorker[Transcription]
+    streaming_conversation: "StreamingConversation"
+
     def __init__(self, transcriber_config: TranscriberConfigType):
+        AbstractWorker.__init__(self)
         self.transcriber_config = transcriber_config
         self.is_muted = False
+        self.speed_manager: Optional[SpeedManager] = None
+
+    def attach_speed_manager(self, speed_manager: SpeedManager):
+        self.speed_manager = speed_manager
 
     def mute(self):
         self.is_muted = True
@@ -51,53 +48,61 @@ class AbstractTranscriber(Generic[TranscriberConfigType]):
         elif self.get_transcriber_config().audio_encoding == AudioEncoding.MULAW:
             return audioop.lin2ulaw(linear_audio, sample_width)
 
-
-class BaseAsyncTranscriber(AbstractTranscriber[TranscriberConfigType], AsyncWorker):
-    def __init__(
-        self,
-        transcriber_config: TranscriberConfigType,
-    ):
-        self.input_queue: asyncio.Queue[bytes] = asyncio.Queue()
-        self.output_queue: asyncio.Queue[Transcription] = asyncio.Queue()
-        AsyncWorker.__init__(self, self.input_queue, self.output_queue)
-        AbstractTranscriber.__init__(self, transcriber_config)
-
+    @abstractmethod
     async def _run_loop(self):
-        raise NotImplementedError
+        pass
 
-    def send_audio(self, chunk):
+    def send_audio(self, chunk: bytes):
         if not self.is_muted:
             self.consume_nonblocking(chunk)
         else:
             self.consume_nonblocking(self.create_silent_chunk(len(chunk)))
 
-    def terminate(self):
-        AsyncWorker.terminate(self)
+    def produce_nonblocking(self, item: Transcription):
+        self.consumer.consume_nonblocking(item)
 
 
-class BaseThreadAsyncTranscriber(
-    AbstractTranscriber[TranscriberConfigType], ThreadAsyncWorker
-):
-    def __init__(
-        self,
-        transcriber_config: TranscriberConfigType,
-    ):
-        self.input_queue: asyncio.Queue[bytes] = asyncio.Queue()
-        self.output_queue: asyncio.Queue[Transcription] = asyncio.Queue()
-        ThreadAsyncWorker.__init__(self, self.input_queue, self.output_queue)
+class BaseAsyncTranscriber(AbstractTranscriber[TranscriberConfigType], AsyncWorker[bytes]):  # type: ignore
+    def __init__(self, transcriber_config: TranscriberConfigType):
         AbstractTranscriber.__init__(self, transcriber_config)
+        AsyncWorker.__init__(self)
+
+    async def terminate(self):
+        await AsyncWorker.terminate(self)
+
+
+class BaseThreadAsyncTranscriber(  # type: ignore
+    AbstractTranscriber[TranscriberConfigType], ThreadAsyncWorker[bytes]
+):
+    def __init__(self, transcriber_config: TranscriberConfigType):
+        AbstractTranscriber.__init__(self, transcriber_config)
+        ThreadAsyncWorker.__init__(self)
 
     def _run_loop(self):
         raise NotImplementedError
 
-    def send_audio(self, chunk):
-        if not self.is_muted:
-            self.consume_nonblocking(chunk)
-        else:
-            self.consume_nonblocking(self.create_silent_chunk(len(chunk)))
+    async def run_thread_forwarding(self):
+        try:
+            await asyncio.gather(
+                self._forward_to_thread(),
+                self._forward_from_thread(),
+            )
+        except asyncio.CancelledError:
+            return
 
-    def terminate(self):
-        ThreadAsyncWorker.terminate(self)
+    async def _forward_from_thread(self):
+        while True:
+            try:
+                transcription = await self.output_janus_queue.async_q.get()
+                self.consumer.consume_nonblocking(transcription)
+            except asyncio.CancelledError:
+                break
+
+    def produce_nonblocking(self, item: Transcription):
+        self.output_janus_queue.sync_q.put_nowait(item)
+
+    async def terminate(self):
+        await ThreadAsyncWorker.terminate(self)
 
 
 BaseTranscriber = Union[

@@ -1,12 +1,16 @@
-import logging
-from typing import Iterable, List, Optional, Tuple
 import uuid
+from typing import Any, Iterable, List, Optional, Tuple, TypeGuard
+
 from langchain.docstore.document import Document
+from loguru import logger
+
 from vocode import getenv
 from vocode.streaming.models.vector_db import PineconeConfig
 from vocode.streaming.vector_db.base_vector_db import VectorDB
 
-logger = logging.getLogger(__name__)
+
+def is_non_empty_string(value: Any) -> TypeGuard[str]:
+    return isinstance(value, str) and len(value) > 0
 
 
 class PineconeDB(VectorDB):
@@ -15,13 +19,12 @@ class PineconeDB(VectorDB):
         self.config = config
 
         self.index_name = self.config.index
-        self.pinecone_api_key = getenv("PINECONE_API_KEY") or self.config.api_key
-        self.pinecone_environment = (
-            getenv("PINECONE_ENVIRONMENT") or self.config.api_environment
-        )
-        self.pinecone_url = (
-            f"https://{self.index_name}.svc.{self.pinecone_environment}.pinecone.io"
-        )
+        pinecone_api_key = getenv("PINECONE_API_KEY") or self.config.api_key
+        if not is_non_empty_string(pinecone_api_key):
+            raise ValueError("Pinecone API key not set or invalid")
+        self.pinecone_api_key = pinecone_api_key
+        self.pinecone_environment = getenv("PINECONE_ENVIRONMENT") or self.config.api_environment
+        self.pinecone_url = f"https://{self.index_name}.svc.{self.pinecone_environment}.pinecone.io"
         self._text_key = "text"
 
     async def add_texts(
@@ -109,7 +112,5 @@ class PineconeDB(VectorDB):
                 score = res["score"]
                 docs.append((Document(page_content=text, metadata=metadata), score))
             else:
-                logger.warning(
-                    f"Found document with no `{self._text_key}` key. Skipping."
-                )
+                logger.warning(f"Found document with no `{self._text_key}` key. Skipping.")
         return docs

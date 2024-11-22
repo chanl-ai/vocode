@@ -10,6 +10,12 @@ To install requirements:
 
 ```bash
 poetry install
+```
+
+Install [`pre-commit`](https://pre-commit.com/) to run linting before pushing, e.g. with Homebrew:
+
+```bash
+brew install pre-commit
 poetry run pre-commit install
 ```
 
@@ -40,7 +46,7 @@ If you submit a PR, we'd love to feature your contribution on Twitter so please 
 
 ## Linting and Typechecking
 
-We use [`black`](https://black.readthedocs.io/en/stable/) for linting. If you're using VSCode, code should auto-format automatically. Otherwise, run the following script before pushing:
+We use [`black`](https://black.readthedocs.io/en/stable/) for linting. If you're using [VSCode](https://code.visualstudio.com/docs/editor/codebasics#_formatting), code should auto-format automatically. Otherwise, run the following script before pushing:
 
 ```
 make lint_diff

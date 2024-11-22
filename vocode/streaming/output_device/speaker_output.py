@@ -1,13 +1,17 @@
 import queue
 from typing import Optional
-import sounddevice as sd
+
 import numpy as np
+import sounddevice as sd
 
-from .base_output_device import BaseOutputDevice
-from vocode.streaming.models.audio_encoding import AudioEncoding
+from vocode.streaming.models.audio import AudioEncoding
+
+from .abstract_output_device import AbstractOutputDevice
+
+raise DeprecationWarning("Use BlockingSpeakerOutput instead")
 
 
-class SpeakerOutput(BaseOutputDevice):
+class SpeakerOutput(AbstractOutputDevice):
     DEFAULT_SAMPLING_RATE = 44100
 
     def __init__(
@@ -49,7 +53,7 @@ class SpeakerOutput(BaseOutputDevice):
             block[:size] = chunk_arr[i : i + size]
             self.queue.put_nowait(block)
 
-    def terminate(self):
+    async def terminate(self):
         self.stream.close()
 
     @classmethod

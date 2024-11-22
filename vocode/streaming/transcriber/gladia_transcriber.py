@@ -1,22 +1,17 @@
 import asyncio
-import json
-import base64
-import logging
-from typing import Optional
-import websockets
 import audioop
+import json
+from typing import Optional
+
 import numpy as np
-from urllib.parse import urlencode
+import websockets
+from loguru import logger
+
 from vocode import getenv
-
-from vocode.streaming.models.transcriber import GladiaTranscriberConfig
+from vocode.streaming.models.audio import AudioEncoding
+from vocode.streaming.models.transcriber import GladiaTranscriberConfig, Transcription
 from vocode.streaming.models.websocket import AudioMessage
-from vocode.streaming.transcriber.base_transcriber import (
-    BaseAsyncTranscriber,
-    Transcription,
-)
-from vocode.streaming.models.audio_encoding import AudioEncoding
-
+from vocode.streaming.transcriber.base_transcriber import BaseAsyncTranscriber
 
 GLADIA_URL = "wss://api.gladia.io/audio/text/audio-transcription"
 
@@ -26,7 +21,6 @@ class GladiaTranscriber(BaseAsyncTranscriber[GladiaTranscriberConfig]):
         self,
         transcriber_config: GladiaTranscriberConfig,
         api_key: Optional[str] = None,
-        logger: Optional[logging.Logger] = None,
     ):
         super().__init__(transcriber_config)
         self.api_key = api_key or getenv("GLADIA_API_KEY")
@@ -35,7 +29,6 @@ class GladiaTranscriber(BaseAsyncTranscriber[GladiaTranscriberConfig]):
                 "Please set GLADIA_API_KEY environment variable or pass it as a parameter"
             )
         self._ended = False
-        self.logger = logger or logging.getLogger(__name__)
         if self.transcriber_config.endpointing_config:
             raise Exception("Gladia endpointing config not supported yet")
 
@@ -60,12 +53,12 @@ class GladiaTranscriber(BaseAsyncTranscriber[GladiaTranscriberConfig]):
         if (
             len(self.buffer) / (2 * self.transcriber_config.sampling_rate)
         ) >= self.transcriber_config.buffer_size_seconds:
-            self.input_queue.put_nowait(self.buffer)
+            self.consume_nonblocking(self.buffer)
             self.buffer = bytearray()
 
-    def terminate(self):
+    async def terminate(self):
         self._ended = True
-        super().terminate()
+        await super().terminate()
 
     async def process(self):
         async with websockets.connect(GLADIA_URL) as ws:
@@ -82,7 +75,7 @@ class GladiaTranscriber(BaseAsyncTranscriber[GladiaTranscriberConfig]):
             async def sender(ws):
                 while not self._ended:
                     try:
-                        data = await asyncio.wait_for(self.input_queue.get(), 5)
+                        data = await asyncio.wait_for(self._input_queue.get(), 5)
                     except asyncio.exceptions.TimeoutError:
                         break
 
@@ -94,7 +87,7 @@ class GladiaTranscriber(BaseAsyncTranscriber[GladiaTranscriberConfig]):
                             }
                         )
                     )
-                self.logger.debug("Terminating Gladia transcriber sender")
+                logger.debug("Terminating Gladia transcriber sender")
 
             async def receiver(ws):
                 while not self._ended:
@@ -104,14 +97,14 @@ class GladiaTranscriber(BaseAsyncTranscriber[GladiaTranscriberConfig]):
                         if "error" in data and data["error"]:
                             raise Exception(data["error"])
                     except websockets.exceptions.ConnectionClosedError as e:
-                        self.logger.debug(e)
+                        logger.debug(e)
                         break
 
                     if data:
                         is_final = data["type"] == "final"
 
                         if "transcription" in data and data["transcription"]:
-                            self.output_queue.put_nowait(
+                            self.produce_nonblocking(
                                 Transcription(
                                     message=data["transcription"],
                                     confidence=data["confidence"],

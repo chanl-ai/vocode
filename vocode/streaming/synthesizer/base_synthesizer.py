@@ -1,9 +1,13 @@
 import asyncio
+import audioop
+import io
+import math
 import os
+import wave
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
-    Generator,
     Callable,
     Generic,
     List,
@@ -12,22 +16,27 @@ from typing import (
     TypeVar,
     Union,
 )
-import math
-import io
-import wave
+
 import aiohttp
+from loguru import logger
 from nltk.tokenize import word_tokenize
 from nltk.tokenize.treebank import TreebankWordDetokenizer
-from opentelemetry import trace
-from opentelemetry.trace import Span
+from sentry_sdk.tracing import Span as SentrySpan
 
-from vocode.streaming.agent.bot_sentiment_analyser import BotSentiment
 from vocode.streaming.models.agent import FillerAudioConfig
-from vocode.streaming.models.message import BaseMessage
-from vocode.streaming.synthesizer.miniaudio_worker import MiniaudioWorker
-from vocode.streaming.utils import convert_wav, get_chunk_size_per_second
-from vocode.streaming.models.audio_encoding import AudioEncoding
+from vocode.streaming.models.audio import AudioEncoding, SamplingRate
+from vocode.streaming.models.message import BaseMessage, BotBackchannel, SilenceMessage
 from vocode.streaming.models.synthesizer import SynthesizerConfig
+from vocode.streaming.synthesizer.audio_cache import AudioCache
+from vocode.streaming.synthesizer.miniaudio_worker import MiniaudioWorker
+from vocode.streaming.telephony.constants import MULAW_SILENCE_BYTE, PCM_SILENCE_BYTE
+from vocode.streaming.utils import convert_wav, get_chunk_size_per_second
+from vocode.streaming.utils.async_requester import AsyncRequestor
+from vocode.streaming.utils.create_task import asyncio_create_task
+from vocode.streaming.utils.worker import QueueConsumer
+
+if TYPE_CHECKING:
+    from vocode.streaming.streaming_conversation import StreamingConversation
 
 FILLER_PHRASES = [
     BaseMessage(text="Um..."),
@@ -55,10 +64,14 @@ def encode_as_wav(chunk: bytes, synthesizer_config: SynthesizerConfig) -> bytes:
     return output_bytes_io.read()
 
 
-tracer = trace.get_tracer(__name__)
-
-
 class SynthesisResult:
+    """Holds audio bytes for an utterance and method to know how much of utterance was spoken
+
+    @param chunk_generator - an async generator that that yields ChunkResult objects, which contain chunks of audio and a flag indicating if it is the last chunk
+    @param get_message_up_to - takes in the number of seconds spoken and returns the message up to that point
+    - *if seconds is None, then it should return the full messages*
+    """
+
     class ChunkResult:
         def __init__(self, chunk: bytes, is_last_chunk: bool):
             self.chunk = chunk
@@ -67,10 +80,18 @@ class SynthesisResult:
     def __init__(
         self,
         chunk_generator: AsyncGenerator[ChunkResult, None],
-        get_message_up_to: Callable[[float], str],
+        get_message_up_to: Callable[[Optional[float]], str],
+        cached: bool = False,
+        is_first: bool = False,
+        synthesis_total_span: Optional[SentrySpan] = None,
+        ttft_span: Optional[SentrySpan] = None,
     ):
         self.chunk_generator = chunk_generator
         self.get_message_up_to = get_message_up_to
+        self.cached = cached
+        self.is_first = is_first
+        self.synthesis_total_span = synthesis_total_span
+        self.ttft_span = ttft_span
 
 
 class FillerAudio:
@@ -100,9 +121,7 @@ class FillerAudio:
         async def chunk_generator(chunk_transform=lambda x: x):
             for i in range(0, len(self.audio_data), chunk_size):
                 if i + chunk_size > len(self.audio_data):
-                    yield SynthesisResult.ChunkResult(
-                        chunk_transform(self.audio_data[i:]), True
-                    )
+                    yield SynthesisResult.ChunkResult(chunk_transform(self.audio_data[i:]), True)
                 else:
                     yield SynthesisResult.ChunkResult(
                         chunk_transform(self.audio_data[i : i + chunk_size]), False
@@ -114,31 +133,131 @@ class FillerAudio:
             )
         else:
             output_generator = chunk_generator()
-        return SynthesisResult(output_generator, lambda seconds: self.message.text)
+        return SynthesisResult(output_generator, lambda _: self.message.text)
+
+
+class CachedAudio:
+    def __init__(
+        self,
+        message: BaseMessage,
+        audio_data: bytes,
+        synthesizer_config: SynthesizerConfig,
+        trailing_silence_seconds: float = 0.0,
+    ):
+        self.message = message
+        self.audio_data = audio_data
+        self.synthesizer_config = synthesizer_config
+        self.trailing_silence_seconds = trailing_silence_seconds
+
+    def create_synthesis_result(self, chunk_size) -> SynthesisResult:
+        async def chunk_generator():
+            if isinstance(self.message, BotBackchannel):
+                yield SynthesisResult.ChunkResult(
+                    self.audio_data, self.trailing_silence_seconds == 0.0
+                )
+            else:
+                for i in range(0, len(self.audio_data), chunk_size):
+                    if i + chunk_size > len(self.audio_data):
+                        yield SynthesisResult.ChunkResult(
+                            self.audio_data[i:], self.trailing_silence_seconds == 0.0
+                        )
+                    else:
+                        yield SynthesisResult.ChunkResult(
+                            self.audio_data[i : i + chunk_size], False
+                        )
+            if self.trailing_silence_seconds > 0:
+                silence_synthesis_result = self.create_silence_synthesis_result(chunk_size)
+                async for chunk_result in silence_synthesis_result.chunk_generator:
+                    yield chunk_result
+
+        if isinstance(self.message, BotBackchannel):
+
+            def get_message_up_to(seconds: Optional[float]):
+                return self.message.text
+
+        else:
+
+            def get_message_up_to(seconds: Optional[float]):
+                return BaseSynthesizer.get_message_cutoff_from_total_response_length(
+                    self.synthesizer_config, self.message, seconds, len(self.audio_data)
+                )
+
+        return SynthesisResult(
+            chunk_generator=chunk_generator(),
+            get_message_up_to=get_message_up_to,
+            cached=True,
+        )
+
+    def create_silence_synthesis_result(self, chunk_size) -> SynthesisResult:
+        async def chunk_generator():
+            size_of_silence = int(
+                self.trailing_silence_seconds * self.synthesizer_config.sampling_rate
+            )
+            silence_byte: bytes
+            if self.synthesizer_config.audio_encoding == AudioEncoding.LINEAR16:
+                silence_byte = PCM_SILENCE_BYTE
+                size_of_silence *= 2
+            elif self.synthesizer_config.audio_encoding == AudioEncoding.MULAW:
+                silence_byte = MULAW_SILENCE_BYTE
+
+            for _ in range(
+                0,
+                size_of_silence,
+                chunk_size,
+            ):
+                yield SynthesisResult.ChunkResult(silence_byte * chunk_size, False)
+            yield SynthesisResult.ChunkResult(silence_byte * chunk_size, True)
+
+        def get_message_up_to(seconds):
+            return ""
+
+        return SynthesisResult(
+            chunk_generator(),
+            get_message_up_to,
+        )
+
+
+class SilenceAudio(CachedAudio):
+    def __init__(
+        self,
+        message: SilenceMessage,
+        synthesizer_config: SynthesizerConfig,
+    ):
+        super().__init__(
+            message,
+            b"",
+            synthesizer_config,
+            trailing_silence_seconds=message.trailing_silence_seconds,
+        )
+
+    def create_synthesis_result(self, chunk_size) -> SynthesisResult:
+        return self.create_silence_synthesis_result(chunk_size)
 
 
 SynthesizerConfigType = TypeVar("SynthesizerConfigType", bound=SynthesizerConfig)
 
 
 class BaseSynthesizer(Generic[SynthesizerConfigType]):
+    streaming_conversation: "StreamingConversation"
+    total_chars: int
+
     def __init__(
         self,
         synthesizer_config: SynthesizerConfigType,
-        aiohttp_session: Optional[aiohttp.ClientSession] = None,
     ):
         self.synthesizer_config = synthesizer_config
         if synthesizer_config.audio_encoding == AudioEncoding.MULAW:
             assert (
-                synthesizer_config.sampling_rate == 8000
+                synthesizer_config.sampling_rate == SamplingRate.RATE_8000
             ), "MuLaw encoding only supports 8kHz sampling rate"
         self.filler_audios: List[FillerAudio] = []
-        if aiohttp_session:
-            # the caller is responsible for closing the session
-            self.aiohttp_session = aiohttp_session
-            self.should_close_session_on_tear_down = False
-        else:
-            self.aiohttp_session = aiohttp.ClientSession()
-            self.should_close_session_on_tear_down = True
+        self.async_requestor = AsyncRequestor()
+        self.total_chars: int = 0
+        self.cost_per_char: Optional[float] = None
+
+    @classmethod
+    def get_voice_identifier(cls, synthesizer_config: SynthesizerConfigType) -> str:
+        raise NotImplementedError
 
     async def empty_generator(self):
         yield SynthesisResult.ChunkResult(b"", True)
@@ -159,6 +278,14 @@ class BaseSynthesizer(Generic[SynthesizerConfigType]):
             seconds_per_chunk=2,
         )
 
+    @classmethod
+    def get_cost(cls, total_chars) -> float:
+        raise NotImplementedError
+
+    @classmethod
+    def compute_total_chars(cls, message: BaseMessage, synthesizer_config: SynthesizerConfigType):
+        return len(message.text)
+
     async def set_filler_audios(self, filler_audio_config: FillerAudioConfig):
         if filler_audio_config.use_phrases:
             self.filler_audios = await self.get_phrase_filler_audios()
@@ -168,7 +295,7 @@ class BaseSynthesizer(Generic[SynthesizerConfigType]):
     async def get_phrase_filler_audios(self) -> List[FillerAudio]:
         return []
 
-    def ready_synthesizer(self):
+    def ready_synthesizer(self, chunk_size: int):
         pass
 
     # given the number of seconds the message was allowed to go until, where did we get in the message?
@@ -176,11 +303,14 @@ class BaseSynthesizer(Generic[SynthesizerConfigType]):
     def get_message_cutoff_from_total_response_length(
         synthesizer_config: SynthesizerConfig,
         message: BaseMessage,
-        seconds: float,
+        seconds: Optional[float],
         size_of_output: int,
     ) -> str:
         estimated_output_seconds = size_of_output / synthesizer_config.sampling_rate
         if not message.text:
+            return message.text
+
+        if seconds is None:
             return message.text
 
         estimated_output_seconds_per_char = estimated_output_seconds / len(message.text)
@@ -188,22 +318,79 @@ class BaseSynthesizer(Generic[SynthesizerConfigType]):
 
     @staticmethod
     def get_message_cutoff_from_voice_speed(
-        message: BaseMessage, seconds: float, words_per_minute: int
+        message: BaseMessage, seconds: Optional[float], words_per_minute: int = 150
     ) -> str:
+
+        if seconds is None:
+            return message.text
+
         words_per_second = words_per_minute / 60
         estimated_words_spoken = math.floor(words_per_second * seconds)
         tokens = word_tokenize(message.text)
         return TreebankWordDetokenizer().detokenize(tokens[:estimated_words_spoken])
 
-    # returns a chunk generator and a thunk that can tell you what part of the message was read given the number of seconds spoken
-    # chunk generator must return a ChunkResult, essentially a tuple (bytes of size chunk_size, flag if it is the last chunk)
+    async def get_cached_audio(
+        self,
+        message: BaseMessage,
+    ) -> Optional[CachedAudio]:
+        audio_cache = await AudioCache.safe_create()
+        cache_phrase = message.cache_phrase or message.text.strip()
+        audio_data = await audio_cache.get_audio(
+            self.get_voice_identifier(self.synthesizer_config), cache_phrase
+        )
+        if audio_data is None:
+            return None
+        logger.info(f"Got cached audio for {cache_phrase}")
+
+        trailing_silence_seconds = 0.0
+        if isinstance(message, BotBackchannel):
+            trailing_silence_seconds = message.trailing_silence_seconds
+        return CachedAudio(message, audio_data, self.synthesizer_config, trailing_silence_seconds)
+
+    async def create_speech_uncached(
+        self,
+        message: BaseMessage,
+        chunk_size: int,
+        is_first_text_chunk: bool = False,
+        is_sole_text_chunk: bool = False,
+    ) -> SynthesisResult:
+        raise NotImplementedError
+
     async def create_speech(
         self,
         message: BaseMessage,
         chunk_size: int,
-        bot_sentiment: Optional[BotSentiment] = None,
+        is_first_text_chunk: bool = False,
+        is_sole_text_chunk: bool = False,
     ) -> SynthesisResult:
-        raise NotImplementedError
+        if isinstance(message, SilenceMessage):
+            return SilenceAudio(
+                message,
+                self.synthesizer_config,
+            ).create_synthesis_result(chunk_size)
+
+        maybe_cached_audio = await self.get_cached_audio(message)
+        if maybe_cached_audio is not None:
+            return maybe_cached_audio.create_synthesis_result(chunk_size)
+        return await self.create_speech_uncached(
+            message,
+            chunk_size,
+            is_first_text_chunk=is_first_text_chunk,
+            is_sole_text_chunk=is_sole_text_chunk,
+        )
+
+    async def chunk_result_generator_from_queue(self, chunk_queue: asyncio.Queue[Optional[bytes]]):
+        while True:
+            try:
+                chunk = await chunk_queue.get()
+                if chunk is None:
+                    break
+                yield SynthesisResult.ChunkResult(
+                    chunk=chunk,
+                    is_last_chunk=False,
+                )
+            except asyncio.CancelledError:
+                break
 
     # @param file - a file-like object in wav format
     @staticmethod
@@ -220,16 +407,15 @@ class BaseSynthesizer(Generic[SynthesizerConfigType]):
         )
 
         if synthesizer_config.should_encode_as_wav:
-            chunk_transform = lambda chunk: encode_as_wav(chunk, synthesizer_config)
+            chunk_transform = lambda chunk: encode_as_wav(chunk, synthesizer_config)  # noqa: E731
+
         else:
-            chunk_transform = lambda chunk: chunk
+            chunk_transform = lambda chunk: chunk  # noqa: E731
 
         async def chunk_generator(output_bytes):
             for i in range(0, len(output_bytes), chunk_size):
                 if i + chunk_size > len(output_bytes):
-                    yield SynthesisResult.ChunkResult(
-                        chunk_transform(output_bytes[i:]), True
-                    )
+                    yield SynthesisResult.ChunkResult(chunk_transform(output_bytes[i:]), True)
                 else:
                     yield SynthesisResult.ChunkResult(
                         chunk_transform(output_bytes[i : i + chunk_size]), False
@@ -246,20 +432,13 @@ class BaseSynthesizer(Generic[SynthesizerConfigType]):
         self,
         response: aiohttp.ClientResponse,
         chunk_size: int,
-        create_speech_span: Optional[Span],
     ) -> AsyncGenerator[SynthesisResult.ChunkResult, None]:
-        miniaudio_worker_input_queue: asyncio.Queue[
-            Union[bytes, None]
-        ] = asyncio.Queue()
-        miniaudio_worker_output_queue: asyncio.Queue[
-            Tuple[bytes, bool]
-        ] = asyncio.Queue()
+        miniaudio_worker_consumer: QueueConsumer = QueueConsumer()
         miniaudio_worker = MiniaudioWorker(
             self.synthesizer_config,
             chunk_size,
-            miniaudio_worker_input_queue,
-            miniaudio_worker_output_queue,
         )
+        miniaudio_worker.consumer = miniaudio_worker_consumer
         miniaudio_worker.start()
         stream_reader = response.content
 
@@ -270,25 +449,43 @@ class BaseSynthesizer(Generic[SynthesizerConfigType]):
             miniaudio_worker.consume_nonblocking(None)  # sentinel
 
         try:
-            asyncio.create_task(send_chunks())
+            asyncio_create_task(send_chunks())
 
             # Await the output queue of the MiniaudioWorker and yield the wav chunks in another loop
             while True:
                 # Get the wav chunk and the flag from the output queue of the MiniaudioWorker
-                wav_chunk, is_last = await miniaudio_worker.output_queue.get()
+                wav_chunk, is_last = await miniaudio_worker_consumer.input_queue.get()
                 if self.synthesizer_config.should_encode_as_wav:
                     wav_chunk = encode_as_wav(wav_chunk, self.synthesizer_config)
 
+                if self.synthesizer_config.audio_encoding == AudioEncoding.MULAW:
+                    wav_chunk = audioop.lin2ulaw(wav_chunk, 2)
+
                 yield SynthesisResult.ChunkResult(wav_chunk, is_last)
                 # If this is the last chunk, break the loop
-                if is_last and create_speech_span is not None:
-                    create_speech_span.end()
+                if is_last:
                     break
         except asyncio.CancelledError:
             pass
         finally:
-            miniaudio_worker.terminate()
+            await miniaudio_worker.terminate()
+
+    def _resample_chunk(
+        self,
+        chunk: bytes,
+        current_sample_rate: int,
+        target_sample_rate: int,
+    ) -> bytes:
+        resampled_chunk, _ = audioop.ratecv(
+            chunk,
+            2,
+            1,
+            current_sample_rate,
+            target_sample_rate,
+            None,
+        )
+
+        return resampled_chunk
 
     async def tear_down(self):
-        if self.should_close_session_on_tear_down:
-            await self.aiohttp_session.close()
+        pass

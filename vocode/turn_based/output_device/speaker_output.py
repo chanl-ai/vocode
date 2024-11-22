@@ -1,12 +1,13 @@
 from typing import Optional
-import sounddevice as sd
+
 import numpy as np
+import sounddevice as sd
 from pydub import AudioSegment
 
-from vocode.turn_based.output_device.base_output_device import BaseOutputDevice
+from vocode.turn_based.output_device.abstract_output_device import AbstractOutputDevice
 
 
-class SpeakerOutput(BaseOutputDevice):
+class SpeakerOutput(AbstractOutputDevice):
     DEFAULT_SAMPLING_RATE = 44100
 
     def __init__(

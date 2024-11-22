@@ -49,38 +49,74 @@
   "navigation": [
     {
       "group": "Getting Started",
-      "pages": ["welcome", "hosted-quickstart", "open-source-quickstart"]
+      "pages": ["welcome", "hosted-quickstart", "open-source-quickstarts"]
     },
     {
       "group": "Vocode 101",
-      "pages": ["what-is-vocode", "how-it-works", "how-to-use-it"]
-    },
-    {
-      "group": "Guides",
       "pages": [
-        "open-source/python-quickstart",
-        "open-source/telephony",
-        "open-source/create-your-own-agent",
-        "open-source/langchain-agent",
-        "open-source/action-agents",
-        "open-source/local-conversation",
-        "open-source/events-manager",
-        "open-source/using-synthesizers",
-        "open-source/using-transcribers",
-        "open-source/react-quickstart",
-        "open-source/playground",
-        "open-source/turn-based-conversation",
-        "open-source/language-support",
-        "open-source/tracing",
-        "open-source/agent-factory"
+        "open-source/what-is-vocode",
+        "open-source/how-it-works",
+        "open-source/how-to-use-it"
       ]
     },
     {
-      "group": "Python",
+      "group": "Getting Started",
       "pages": [
-        "open-source/transcriber-reference",
-        "open-source/agent-reference",
-        "open-source/synthesizer-reference"
+        "open-source/python-quickstart",
+        "open-source/react-quickstart",
+        "open-source/telephony",
+        "open-source/livekit-webrtc",
+        "open-source/turn-based-conversation"
+      ]
+    },
+    {
+      "group": "Agents",
+      "pages": [
+        "open-source/create-your-own-agent",
+        "open-source/agent-factory",
+        "open-source/langchain-agent"
+      ]
+    },
+    {
+      "group": "Synthesizers (Voice)",
+      "pages": ["open-source/using-synthesizers"]
+    },
+    {
+      "group": "Transcribers (Speech-to-Text)",
+      "pages": ["open-source/using-transcribers"]
+    },
+    {
+      "group": "Actions",
+      "pages": [
+        "open-source/agents-with-actions",
+        "open-source/action-phrase-triggers",
+        "open-source/external-action"
+      ]
+    },
+    {
+      "group": "Conversation Tuning",
+      "pages": [
+        "open-source/conversation-mechanics",
+        "open-source/language-support"
+      ]
+    },
+    {
+      "group": "Monitoring",
+      "pages": ["open-source/logging-with-loguru", "open-source/sentry"]
+    },
+    {
+      "group": "Testing",
+      "pages": ["open-source/playground"]
+    },
+    {
+      "group": "Advanced Functionality",
+      "pages": ["open-source/events-manager"]
+    },
+    {
+      "group": "Legacy (0.0.111) Guides",
+      "pages": [
+        "open-source/langchain-agent-dep",
+        "open-source/local-conversation"
       ]
     },
     {
@@ -89,6 +125,7 @@
         "api-reference/numbers/list-numbers",
         "api-reference/numbers/get-number",
         "api-reference/numbers/buy-number",
+        "api-reference/numbers/link-number",
         "api-reference/numbers/update-number",
         "api-reference/numbers/cancel-number"
       ]
@@ -173,21 +210,40 @@
     {
       "group": "Hosted Walkthrough",
       "pages": [
-        "getting-number",
+        "walkthrough_intro",
+        "setting-up-number",
         "configuring-number",
-        "retrieve-call-data",
+        "setting-up-webhook"
+      ]
+    },
+    {
+      "group": "Guides",
+      "pages": [
+        "agents",
+        "prompts",
+        "prompt-engineering",
+        "voices",
+        "webhooks",
+        "actions",
+        "action-triggers",
         "conversational-dials",
-        "setting-up-webhook",
-        "using-actions",
-        "vectordb",
-        "multilingual",
-        "injecting-context",
+        "retrieve-call-data",
         "machine-detection",
-        "ivr-navigation",
-        "hipaa-compliance",
         "do-not-call-detection",
         "bring-your-own-telephony",
         "bring-your-own-openai"
+      ]
+    },
+    {
+      "group": "Beta Features",
+      "pages": [
+        "external-actions",
+        "warm-transfer",
+        "multilingual",
+        "injecting-context",
+        "ivr-navigation",
+        "vectordb",
+        "hipaa-compliance"
       ]
     }
   ],
